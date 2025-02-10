@@ -1,16 +1,26 @@
 #!/bin/bash
+# ====== Автоматическая конвертация CRLF в LF (если необходимо) ======
+# Если в файле присутствуют символы возврата каретки (\r), конвертируем файл и переисполняем его.
+if grep -q $'\r' "$0"; then
+    echo "Обнаружены Windows-окончания строк. Выполняется автоматическая конвертация в Unix-формат..."
+    tmpfile=$(mktemp /tmp/$(basename "$0").XXXXXX)
+    sed 's/\r$//' "$0" > "$tmpfile"
+    exec bash "$tmpfile" "$@"
+fi
+# ===================================================================
+
 # marzban_log_cleanup.sh
 # Скрипт для очистки логов Marzban с возможностью резервного копирования.
 #
 # Использование:
 #   1. Для установки (интерактивная настройка и установка задания cron):
-#          sudo ./marzban_log_cleanup.sh install
+#          sudo marzban_log_cleanup.sh install
 #
-#   2. Для вызова меню настройки (для изменения настроек очистки, резервного копирования или немедленной очистки):
+#   2. Для вызова меню (изменение настроек или немедленная очистка):
 #          sudo marzban_log_cleanup.sh log clean
 #
-#   3. Для выполнения очистки логов (автоматически вызывается заданием cron):
-#          sudo ./marzban_log_cleanup.sh
+#   3. Для выполнения очистки (автоматически вызывается cron'ом):
+#          sudo marzban_log_cleanup.sh
 #
 # После установки скрипт копируется в /usr/local/bin,
 # а конфигурация сохраняется в /etc/marzban_cleanup.conf.
@@ -19,9 +29,7 @@
 #   Access log: /var/lib/marzban/access.log
 #   Error log:  /var/lib/marzban/error.log
 
-# Путь к конфигурационному файлу
 CONFIG_FILE="/etc/marzban_cleanup.conf"
-# Путь установки скрипта
 SCRIPT_PATH="/usr/local/bin/marzban_log_cleanup.sh"
 
 ########################################
@@ -76,10 +84,10 @@ EOF
 ########################################
 update_cron_job() {
     local interval="$1"
-    # Формирование cron-задания – запуск в ноль минут каждого часа, кратного interval.
+    # Формирование cron-задания: запуск в 0 минут каждого часа, кратного interval.
     local new_cron="0 */$interval * * * $SCRIPT_PATH >> /var/log/marzban_cleanup.log 2>&1"
     echo "Обновление задания cron..."
-    # Удаляем старые задания, содержащие SCRIPT_PATH, из crontab пользователя root
+    # Удаляем старые задания с $SCRIPT_PATH из crontab пользователя root
     (sudo crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH") | sudo crontab -
     # Добавляем новое задание
     (sudo crontab -l 2>/dev/null; echo "$new_cron") | sudo crontab -
