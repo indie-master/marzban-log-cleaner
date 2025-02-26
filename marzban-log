@@ -1,0 +1,129 @@
+#!/bin/bash
+
+CONFIG_FILE="/etc/marzban_cleanup.conf"
+SCRIPT_URL="https://raw.githubusercontent.com/indie-master/marzban-log-cleaner/main/marzban-log"
+SCRIPT_PATH="/usr/local/bin/marzban-log"
+
+# Проверяем и создаем конфигурацию
+ensure_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "Создание конфигурации..."
+        sudo tee "$CONFIG_FILE" > /dev/null <<EOF
+ACCESS_LOG="/var/lib/marzban/access.log"
+ERROR_LOG="/var/lib/marzban/error.log"
+CLEAN_INTERVAL="12"
+BACKUP_ENABLED="no"
+BACKUP_DIR=""
+EOF
+    fi
+}
+
+# Установка скрипта
+install_script() {
+    echo "Установка marzban-log..."
+    sudo curl -o "$SCRIPT_PATH" -L "$SCRIPT_URL"
+    sudo chmod +x "$SCRIPT_PATH"
+    ensure_config
+    setup_cron
+    echo "Установка завершена! Используйте 'marzban-log' для управления."
+}
+
+# Настройка cron
+setup_cron() {
+    ensure_config
+    source "$CONFIG_FILE"
+    local new_cron="0 */$CLEAN_INTERVAL * * * $SCRIPT_PATH clean"
+    (sudo crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH") | sudo crontab -
+    (sudo crontab -l 2>/dev/null; echo "$new_cron") | sudo crontab -
+    echo "Cron обновлён: $new_cron"
+}
+
+# Очистка логов
+cleanup_logs() {
+    ensure_config
+    source "$CONFIG_FILE"
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+
+    process_log() {
+        local log_file="$1"
+        if [ -f "$log_file" ]; then
+            [ "$BACKUP_ENABLED" == "yes" ] && sudo cp "$log_file" "$BACKUP_DIR/$(basename "$log_file")_$timestamp"
+            sudo truncate -s 0 "$log_file"
+            echo "Очищен: $log_file"
+        else
+            echo "Файл не найден: $log_file"
+        fi
+    }
+
+    process_log "$ACCESS_LOG"
+    process_log "$ERROR_LOG"
+}
+
+# Изменение настроек
+config_script() {
+    ensure_config
+    source "$CONFIG_FILE"
+
+    echo "Настройки:"
+    echo "1) Частота очистки ($CLEAN_INTERVAL ч.)"
+    echo "2) Бэкапы ($BACKUP_ENABLED)"
+    echo "3) Папка бэкапов ($BACKUP_DIR)"
+    echo "4) Выход"
+    read -p "Выберите опцию: " choice
+
+    case $choice in
+        1) read -p "Введите новую частоту очистки: " CLEAN_INTERVAL ;;
+        2) read -p "Включить бэкапы? (yes/no): " BACKUP_ENABLED ;;
+        3) read -p "Введите путь для бэкапов: " BACKUP_DIR ;;
+        4) return ;;
+        *) echo "Неверный ввод." ;;
+    esac
+
+    sudo tee "$CONFIG_FILE" > /dev/null <<EOF
+ACCESS_LOG="/var/lib/marzban/access.log"
+ERROR_LOG="/var/lib/marzban/error.log"
+CLEAN_INTERVAL="$CLEAN_INTERVAL"
+BACKUP_ENABLED="$BACKUP_ENABLED"
+BACKUP_DIR="$BACKUP_DIR"
+EOF
+
+    setup_cron
+    echo "Настройки сохранены."
+}
+
+# Обновление скрипта
+update_script() {
+    echo "Обновление marzban-log..."
+    sudo curl -o "$SCRIPT_PATH" -L "$SCRIPT_URL"
+    sudo chmod +x "$SCRIPT_PATH"
+    echo "Обновление завершено!"
+}
+
+# Вывод статуса
+show_status() {
+    ensure_config
+    source "$CONFIG_FILE"
+    echo "=== Текущие настройки ==="
+    cat "$CONFIG_FILE"
+}
+
+# Вывод справки
+show_help() {
+    echo "=== Доступные команды ==="
+    echo "  marzban-log          - Показать список команд"
+    echo "  marzban-log clean    - Очистить логи вручную"
+    echo "  marzban-log update   - Обновить скрипт"
+    echo "  marzban-log status   - Показать текущие настройки"
+    echo "  marzban-log install  - Установить и настроить скрипт"
+    echo "  marzban-log config   - Изменить настройки"
+}
+
+# Обработка аргументов
+case "$1" in
+    install) install_script ;;
+    clean) cleanup_logs ;;
+    update) update_script ;;
+    status) show_status ;;
+    config) config_script ;;
+    *) show_help ;;
+esac
