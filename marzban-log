@@ -11,6 +11,8 @@ ensure_config() {
         sudo tee "$CONFIG_FILE" > /dev/null <<EOF
 ACCESS_LOG="/var/lib/marzban/access.log"
 ERROR_LOG="/var/lib/marzban/error.log"
+NODE_ACCESS_LOG="/var/lib/marzban-node/access.log"
+NODE_ERROR_LOG="/var/lib/marzban-node/error.log"
 CLEAN_INTERVAL="12"
 BACKUP_ENABLED="no"
 BACKUP_DIR=""
@@ -57,6 +59,8 @@ cleanup_logs() {
 
     process_log "$ACCESS_LOG"
     process_log "$ERROR_LOG"
+    process_log "$NODE_ACCESS_LOG"
+    process_log "$NODE_ERROR_LOG"
 }
 
 # Изменение настроек
@@ -82,6 +86,8 @@ config_script() {
     sudo tee "$CONFIG_FILE" > /dev/null <<EOF
 ACCESS_LOG="/var/lib/marzban/access.log"
 ERROR_LOG="/var/lib/marzban/error.log"
+NODE_ACCESS_LOG="/var/lib/marzban-node/access.log"
+NODE_ERROR_LOG="/var/lib/marzban-node/error.log"
 CLEAN_INTERVAL="$CLEAN_INTERVAL"
 BACKUP_ENABLED="$BACKUP_ENABLED"
 BACKUP_DIR="$BACKUP_DIR"
