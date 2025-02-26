@@ -40,10 +40,19 @@ setup_cron() {
     echo "Cron обновлён: $new_cron"
 }
 
+# Проверка и создание папки для бэкапов
+ensure_backup_dir() {
+    if [ "$BACKUP_ENABLED" == "yes" ] && [ ! -d "$BACKUP_DIR" ]; then
+        echo "Создание директории для бэкапов: $BACKUP_DIR"
+        sudo mkdir -p "$BACKUP_DIR"
+    fi
+}
+
 # Очистка логов
 cleanup_logs() {
     ensure_config
     source "$CONFIG_FILE"
+    ensure_backup_dir
     timestamp=$(date +"%Y%m%d_%H%M%S")
 
     process_log() {
