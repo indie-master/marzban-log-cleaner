@@ -134,6 +134,8 @@ show_help() {
 }
 
 # Обработка аргументов
+echo "Начало обработки аргумента: $1"
+
 case "$1" in
     install) install_script ;;
     clean) cleanup_logs ;;
@@ -142,3 +144,4 @@ case "$1" in
     config) config_script ;;
     *) show_help ;;
 esac
+
