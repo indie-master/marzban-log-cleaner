@@ -1,210 +1,556 @@
-#!/bin/bash
+#!/usr/bin/env python3
+"""Configurable log cleaner for Marzban and any custom log file."""
+from __future__ import annotations
 
-CONFIG_FILE="/etc/marzban_cleanup.conf"
-SCRIPT_URL="https://raw.githubusercontent.com/indie-master/marzban-log-cleaner/main/marzban-log"
-SCRIPT_PATH="/usr/local/bin/marzban-log"
-DEFAULT_ACCESS_LOG="/var/lib/marzban/access.log"
-DEFAULT_ERROR_LOG="/var/lib/marzban/error.log"
-DEFAULT_NODE_ACCESS_LOG="/var/lib/marzban-node/access.log"
-DEFAULT_NODE_ERROR_LOG="/var/lib/marzban-node/error.log"
-DEFAULT_CLEAN_INTERVAL="12"
+import argparse
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import textwrap
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-validate_interval() {
-    local value="$1"
-    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
-        echo "$value"
-    else
-        echo ""
-    fi
-}
+CONFIG_DIR = Path(os.environ.get("MARZBAN_LOG_CONFIG_DIR", "/etc/marzban-log-cleaner"))
+CONFIG_FILE = Path(os.environ.get("MARZBAN_LOG_CONFIG", str(CONFIG_DIR / "config.yml")))
+LEGACY_CONFIG_FILE = Path(os.environ.get("MARZBAN_LOG_LEGACY_CONFIG", "/etc/marzban_cleanup.conf"))
+SCRIPT_PATH = Path(os.environ.get("MARZBAN_LOG_SCRIPT_PATH", "/usr/local/bin/marzban-log"))
+SCRIPT_URL = "https://raw.githubusercontent.com/indie-master/marzban-log-cleaner/main/marzban-log"
+SERVICE_NAME = "marzban-log-cleaner.service"
+TIMER_NAME = "marzban-log-cleaner.timer"
+SYSTEMD_DIR = Path(os.environ.get("MARZBAN_LOG_SYSTEMD_DIR", "/etc/systemd/system"))
+VALID_ACTIONS = {"truncate", "delete"}
+DEFAULT_LOGS = [
+    {"name": "marzban-access", "path": "/var/lib/marzban/access.log", "max_age": "7d", "action": "truncate", "enabled": True},
+    {"name": "marzban-error", "path": "/var/lib/marzban/error.log", "max_age": "14d", "action": "truncate", "enabled": True},
+    {"name": "marzban-node-access", "path": "/var/lib/marzban-node/access.log", "max_age": "3d", "action": "truncate", "enabled": True},
+    {"name": "marzban-node-error", "path": "/var/lib/marzban-node/error.log", "max_age": "3d", "action": "truncate", "enabled": True},
+]
 
-write_config() {
-    sudo tee "$CONFIG_FILE" > /dev/null <<EOF
-ACCESS_LOG="${ACCESS_LOG:-$DEFAULT_ACCESS_LOG}"
-ERROR_LOG="${ERROR_LOG:-$DEFAULT_ERROR_LOG}"
-NODE_ACCESS_LOG="${NODE_ACCESS_LOG:-$DEFAULT_NODE_ACCESS_LOG}"
-NODE_ERROR_LOG="${NODE_ERROR_LOG:-$DEFAULT_NODE_ERROR_LOG}"
-CLEAN_INTERVAL="${CLEAN_INTERVAL:-$DEFAULT_CLEAN_INTERVAL}"
-BACKUP_ENABLED="${BACKUP_ENABLED:-no}"
-BACKUP_DIR="${BACKUP_DIR:-}"
-EOF
-}
 
-# Проверяем и создаем конфигурацию
-ensure_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "Создание конфигурации..."
-        ACCESS_LOG="$DEFAULT_ACCESS_LOG"
-        ERROR_LOG="$DEFAULT_ERROR_LOG"
-        NODE_ACCESS_LOG="$DEFAULT_NODE_ACCESS_LOG"
-        NODE_ERROR_LOG="$DEFAULT_NODE_ERROR_LOG"
-        CLEAN_INTERVAL="$DEFAULT_CLEAN_INTERVAL"
-        BACKUP_ENABLED="no"
-        BACKUP_DIR=""
-        write_config
-    fi
-}
+@dataclass
+class LogRule:
+    name: str
+    path: Path
+    max_age: str
+    max_age_seconds: int
+    action: str
+    enabled: bool
 
-# Установка скрипта
-install_script() {
-    echo "Установка marzban-log..."
-    sudo curl -o "$SCRIPT_PATH" -L "$SCRIPT_URL"
-    sudo chmod +x "$SCRIPT_PATH"
-    ensure_config
-    setup_cron
-    echo "Установка завершена! Используйте 'marzban-log' для управления."
-}
 
-# Настройка cron
-setup_cron() {
-    ensure_config
-    source "$CONFIG_FILE"
-    local validated_interval
-    validated_interval=$(validate_interval "$CLEAN_INTERVAL")
-    if [ -z "$validated_interval" ]; then
-        echo "Некорректное значение CLEAN_INTERVAL=$CLEAN_INTERVAL. Используется значение по умолчанию: $DEFAULT_CLEAN_INTERVAL"
-        CLEAN_INTERVAL="$DEFAULT_CLEAN_INTERVAL"
-        write_config
-        validated_interval="$DEFAULT_CLEAN_INTERVAL"
-    fi
-    local new_cron="0 */$validated_interval * * * $SCRIPT_PATH clean"
-    (sudo crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH") | sudo crontab -
-    (sudo crontab -l 2>/dev/null; echo "$new_cron") | sudo crontab -
-    echo "Cron обновлён: $new_cron"
-}
+def log(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}")
 
-# Проверка и создание папки для бэкапов
-ensure_backup_dir() {
-    if [ "$BACKUP_ENABLED" == "yes" ]; then
-        if [ -z "$BACKUP_DIR" ]; then
-            echo "Бэкапы включены, но путь BACKUP_DIR не задан. Пропуск резервного копирования."
-            return 1
-        fi
-        if [ ! -d "$BACKUP_DIR" ]; then
-            echo "Создание директории для бэкапов: $BACKUP_DIR"
-            sudo mkdir -p "$BACKUP_DIR"
-        fi
-    fi
-}
 
-# Очистка логов
-cleanup_logs() {
-    ensure_config
-    source "$CONFIG_FILE"
-    ensure_backup_dir
-    timestamp=$(date +"%Y%m%d_%H%M%S")
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-    process_log() {
-        local log_file="$1"
-        if [ -f "$log_file" ]; then
-            if [ "$BACKUP_ENABLED" == "yes" ] && [ -n "$BACKUP_DIR" ]; then
-                sudo cp "$log_file" "$BACKUP_DIR/$(basename "$log_file")_$timestamp"
-            fi
-            sudo truncate -s 0 "$log_file"
-            echo "Очищен: $log_file"
-        else
-            echo "Файл не найден: $log_file"
-        fi
-    }
 
-    process_log "$ACCESS_LOG"
-    process_log "$ERROR_LOG"
-    process_log "$NODE_ACCESS_LOG"
-    process_log "$NODE_ERROR_LOG"
-}
+def need_root_hint(path: Path) -> str:
+    return f" (попробуйте запустить через sudo, если нужны права на запись в {path})"
 
-# Изменение настроек
-config_script() {
-    ensure_config
-    while true; do
-        source "$CONFIG_FILE"
-        echo "=== Настройки marzban-log ==="
-        echo "1) Изменить частоту очистки (текущая: ${CLEAN_INTERVAL} ч.)"
-        echo "2) Переключить резервное копирование (сейчас: $BACKUP_ENABLED)"
-        echo "3) Указать папку для бэкапов (текущая: ${BACKUP_DIR:-не задана})"
-        echo "4) Выход"
-        read -p "Выберите опцию: " choice
 
-        case $choice in
-            1)
-                read -p "Введите новую частоту очистки (в часах): " new_interval
-                local validated
-                validated=$(validate_interval "$new_interval")
-                if [ -n "$validated" ]; then
-                    CLEAN_INTERVAL="$validated"
-                    echo "Частота очистки обновлена: ${CLEAN_INTERVAL} ч."
-                else
-                    echo "Некорректное значение: $new_interval"
-                    continue
-                fi
-                ;;
-            2)
-                read -p "Включить бэкапы? (yes/no): " new_backup
-                new_backup=$(echo "$new_backup" | tr '[:upper:]' '[:lower:]')
-                if [[ "$new_backup" == "yes" || "$new_backup" == "no" ]]; then
-                    BACKUP_ENABLED="$new_backup"
-                    echo "Резервное копирование: $BACKUP_ENABLED"
-                else
-                    echo "Введите 'yes' или 'no'."
-                    continue
-                fi
-                ;;
-            3)
-                read -p "Введите путь для бэкапов: " new_dir
-                BACKUP_DIR="$new_dir"
-                echo "Папка бэкапов: ${BACKUP_DIR:-не задана}"
-                ;;
-            4)
-                break
-                ;;
-            *)
-                echo "Неверный ввод."
-                continue
-                ;;
-        esac
+def render_config(logs: list[dict[str, Any]] | None = None) -> str:
+    logs = logs or DEFAULT_LOGS
+    lines = [
+        "# Marzban Log Cleaner configuration",
+        "# max_age supports minutes/hours/days: 30m, 12h, 7d, 30d",
+        "# action: truncate keeps the file inode for running services; delete removes the file completely.",
+        "logs:",
+    ]
+    for item in logs:
+        lines.extend(
+            [
+                f"  - name: {item['name']}",
+                f"    path: {item['path']}",
+                f"    max_age: {item['max_age']}",
+                f"    action: {item['action']}",
+                f"    enabled: {str(item['enabled']).lower()}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
-        write_config
-        setup_cron
-        echo "Настройки сохранены."
-    done
-}
 
-# Обновление скрипта
-update_script() {
-    echo "Обновление marzban-log..."
-    sudo curl -o "$SCRIPT_PATH" -L "$SCRIPT_URL"
-    sudo chmod +x "$SCRIPT_PATH"
-    echo "Обновление завершено!"
-}
+def backup_file(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copy2(path, backup)
+    return backup
 
-# Вывод статуса
-show_status() {
-    ensure_config
-    source "$CONFIG_FILE"
-    echo "=== Текущие настройки ==="
-    cat "$CONFIG_FILE"
-}
 
-# Вывод справки
-show_help() {
-    echo "=== Доступные команды ==="
-    echo "  marzban-log          - Показать список команд"
-    echo "  marzban-log clean    - Очистить логи вручную"
-    echo "  marzban-log update   - Обновить скрипт"
-    echo "  marzban-log status   - Показать текущие настройки"
-    echo "  marzban-log install  - Установить и настроить скрипт"
-    echo "  marzban-log config   - Изменить настройки"
-}
+def ensure_config(create: bool = True) -> bool:
+    if CONFIG_FILE.exists():
+        return True
+    if not create:
+        return False
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        migrated = migrate_legacy_config()
+        if migrated:
+            return True
+        CONFIG_FILE.write_text(render_config(), encoding="utf-8")
+        log(f"Создан дефолтный конфиг: {CONFIG_FILE}")
+        return True
+    except PermissionError as exc:
+        log(f"Ошибка прав доступа при создании конфига {CONFIG_FILE}: {exc}{need_root_hint(CONFIG_FILE.parent)}")
+        return False
+    except OSError as exc:
+        log(f"Не удалось создать конфиг {CONFIG_FILE}: {exc}")
+        return False
 
-# Обработка аргументов
-arg="${1:-}"
 
-case "$arg" in
-    install) install_script ;;
-    clean) cleanup_logs ;;
-    update) update_script ;;
-    status) show_status ;;
-    config) config_script ;;
-    *) show_help ;;
-esac
+def migrate_legacy_config() -> bool:
+    if not LEGACY_CONFIG_FILE.exists():
+        return False
+    backup = backup_file(LEGACY_CONFIG_FILE)
+    data: dict[str, str] = {}
+    for raw in LEGACY_CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip().strip('"').strip("'")
+    logs: list[dict[str, Any]] = []
+    mapping = [
+        ("ACCESS_LOG", "marzban-access", "7d"),
+        ("ERROR_LOG", "marzban-error", "14d"),
+        ("NODE_ACCESS_LOG", "marzban-node-access", "3d"),
+        ("NODE_ERROR_LOG", "marzban-node-error", "3d"),
+    ]
+    for key, name, age in mapping:
+        if data.get(key):
+            logs.append({"name": name, "path": data[key], "max_age": age, "action": "truncate", "enabled": True})
+    if not logs:
+        logs = DEFAULT_LOGS
+    CONFIG_FILE.write_text(render_config(logs), encoding="utf-8")
+    msg = f"Создан новый YAML-конфиг из legacy {LEGACY_CONFIG_FILE}: {CONFIG_FILE}"
+    if backup:
+        msg += f"; backup legacy-конфига: {backup}"
+    log(msg)
+    return True
 
+
+def parse_scalar(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value[0:1] in {'"', "'"} and value[-1:] == value[0]:
+        return value[1:-1]
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    return value
+
+
+def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
+    """Parse the small YAML subset used by this project without external dependencies."""
+    try:
+        raw_lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise ValueError(f"конфиг не найден: {path}") from exc
+    except PermissionError as exc:
+        raise ValueError(f"нет прав на чтение конфига {path}: {exc}") from exc
+
+    config: dict[str, Any] = {"logs": []}
+    in_logs = False
+    current: dict[str, Any] | None = None
+    for number, raw in enumerate(raw_lines, start=1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped == "logs:":
+            in_logs = True
+            continue
+        if not in_logs:
+            raise ValueError(f"строка {number}: ожидается только верхний ключ 'logs:'")
+        if stripped.startswith("- "):
+            if current is not None:
+                config["logs"].append(current)
+            current = {}
+            tail = stripped[2:].strip()
+            if tail:
+                if ":" not in tail:
+                    raise ValueError(f"строка {number}: некорректный элемент списка")
+                key, value = tail.split(":", 1)
+                current[key.strip()] = parse_scalar(value)
+            continue
+        if current is None:
+            raise ValueError(f"строка {number}: параметр лога указан до элемента '-'")
+        if ":" not in stripped:
+            raise ValueError(f"строка {number}: ожидается формат 'ключ: значение'")
+        key, value = stripped.split(":", 1)
+        current[key.strip()] = parse_scalar(value)
+    if current is not None:
+        config["logs"].append(current)
+    if not isinstance(config.get("logs"), list):
+        raise ValueError("ключ 'logs' должен быть списком")
+    return config
+
+
+def parse_max_age(value: Any) -> int:
+    text = str(value).strip().lower()
+    if not text or len(text) < 2:
+        raise ValueError("max_age должен быть в формате 30m, 12h, 7d или 30d")
+    number, unit = text[:-1], text[-1]
+    if not number.isdigit() or int(number) <= 0:
+        raise ValueError(f"некорректное max_age '{value}': число должно быть положительным")
+    factors = {"m": 60, "h": 3600, "d": 86400}
+    if unit not in factors:
+        raise ValueError(f"некорректное max_age '{value}': используйте суффикс m, h или d")
+    return int(number) * factors[unit]
+
+
+def validate_rules(config: dict[str, Any]) -> list[LogRule]:
+    errors: list[str] = []
+    rules: list[LogRule] = []
+    logs = config.get("logs")
+    if not isinstance(logs, list):
+        raise ValueError("ключ 'logs' должен быть списком")
+    for index, item in enumerate(logs, start=1):
+        prefix = f"logs[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{prefix}: запись должна быть объектом")
+            continue
+        name = item.get("name")
+        path = item.get("path")
+        max_age = item.get("max_age")
+        action = str(item.get("action", "truncate")).strip().lower()
+        enabled = item.get("enabled", True)
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{prefix}.name: обязательная непустая строка")
+        if not isinstance(path, str) or not path.strip():
+            errors.append(f"{prefix}.path: обязательная непустая строка")
+        if max_age is None:
+            errors.append(f"{prefix}.max_age: обязательное значение")
+            age_seconds = 0
+        else:
+            try:
+                age_seconds = parse_max_age(max_age)
+            except ValueError as exc:
+                errors.append(f"{prefix}.max_age: {exc}")
+                age_seconds = 0
+        if action not in VALID_ACTIONS:
+            errors.append(f"{prefix}.action: поддерживаются только truncate или delete")
+        if not isinstance(enabled, bool):
+            errors.append(f"{prefix}.enabled: должно быть true или false")
+        if not errors or all(not err.startswith(prefix) for err in errors):
+            rules.append(LogRule(str(name).strip(), Path(str(path).strip()), str(max_age).strip(), age_seconds, action, enabled))
+    if errors:
+        raise ValueError("\n".join(errors))
+    return rules
+
+
+def get_rules(create_config: bool = True) -> list[LogRule]:
+    if not ensure_config(create=create_config):
+        raise ValueError(f"конфиг недоступен: {CONFIG_FILE}")
+    return validate_rules(load_config())
+
+
+def human_size(size: int | None) -> str:
+    if size is None:
+        return "-"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
+
+
+def human_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def file_info(path: Path) -> tuple[bool, int | None, float | None]:
+    try:
+        st = path.stat()
+        return True, st.st_size, max(0, time.time() - st.st_mtime)
+    except FileNotFoundError:
+        return False, None, None
+    except PermissionError:
+        return True, None, None
+
+
+def command_status(_: argparse.Namespace) -> int:
+    try:
+        rules = get_rules()
+    except ValueError as exc:
+        log(f"Ошибка конфига: {exc}")
+        return 1
+    print(f"Config: {CONFIG_FILE}")
+    print(f"{'ENABLED':<8} {'NAME':<24} {'ACTION':<9} {'MAX_AGE':<8} {'EXISTS':<7} {'AGE':<8} {'SIZE':<10} PATH")
+    for rule in rules:
+        exists, size, age = file_info(rule.path)
+        print(
+            f"{str(rule.enabled).lower():<8} {rule.name:<24} {rule.action:<9} {rule.max_age:<8} "
+            f"{str(exists).lower():<7} {human_age(age):<8} {human_size(size):<10} {rule.path}"
+        )
+    return 0
+
+
+def command_validate(_: argparse.Namespace) -> int:
+    try:
+        rules = get_rules(create_config=False)
+    except ValueError as exc:
+        print(f"Config: {CONFIG_FILE}")
+        print(f"INVALID: {exc}")
+        return 1
+    print(f"Config: {CONFIG_FILE}")
+    print(f"OK: найдено правил: {len(rules)}")
+    return 0
+
+
+def should_clean(rule: LogRule) -> tuple[bool, str, os.stat_result | None]:
+    try:
+        st = rule.path.stat()
+    except FileNotFoundError:
+        return False, "файл отсутствует", None
+    except PermissionError as exc:
+        return False, f"нет прав на чтение метаданных: {exc}", None
+    if not stat.S_ISREG(st.st_mode):
+        return False, "путь существует, но это не обычный файл", st
+    age = max(0, time.time() - st.st_mtime)
+    if age < rule.max_age_seconds:
+        return False, f"возраст {human_age(age)} меньше max_age {rule.max_age}", st
+    return True, f"возраст {human_age(age)} достиг max_age {rule.max_age}", st
+
+
+def truncate_file(path: Path, dry_run: bool) -> bool:
+    if dry_run:
+        return True
+    try:
+        with path.open("r+b") as handle:
+            handle.truncate(0)
+        return True
+    except PermissionError as exc:
+        log(f"ERROR truncate {path}: нет прав доступа: {exc}{need_root_hint(path)}")
+        return False
+    except OSError as exc:
+        log(f"ERROR truncate {path}: {exc}")
+        return False
+
+
+def delete_file(path: Path, dry_run: bool) -> bool:
+    if dry_run:
+        return True
+    try:
+        path.unlink()
+        return True
+    except PermissionError as exc:
+        log(f"ERROR delete {path}: нет прав доступа: {exc}{need_root_hint(path.parent)}")
+        return False
+    except OSError as exc:
+        log(f"ERROR delete {path}: {exc}")
+        return False
+
+
+def command_clean(args: argparse.Namespace) -> int:
+    try:
+        rules = get_rules()
+    except ValueError as exc:
+        log(f"Ошибка конфига: {exc}")
+        return 1
+    failures = 0
+    if args.dry_run:
+        log("DRY-RUN: изменения файлов отключены")
+    for rule in rules:
+        if not rule.enabled:
+            log(f"SKIP {rule.name} ({rule.path}): enabled=false")
+            continue
+        eligible, reason, _ = should_clean(rule)
+        if not eligible:
+            log(f"SKIP {rule.name} ({rule.path}): {reason}")
+            continue
+        if rule.action == "truncate":
+            ok = truncate_file(rule.path, args.dry_run)
+            verb = "WOULD truncate" if args.dry_run else "TRUNCATED"
+        else:
+            ok = delete_file(rule.path, args.dry_run)
+            verb = "WOULD delete" if args.dry_run else "DELETED"
+        if ok:
+            log(f"{verb} {rule.name} ({rule.path}): {reason}")
+        else:
+            failures += 1
+    return 1 if failures else 0
+
+
+def command_config(_: argparse.Namespace) -> int:
+    ensure_config(create=True)
+    print(f"Config path: {CONFIG_FILE}")
+    print("Example:")
+    print(textwrap.indent(render_config([{"name": "custom-nginx-log", "path": "/var/log/nginx/custom.log", "max_age": "30d", "action": "delete", "enabled": False}]), "  "))
+    return 0
+
+
+def append_rule(rule: dict[str, Any]) -> None:
+    rules = [r.__dict__ for r in get_rules()]
+    logs = [
+        {"name": r["name"], "path": str(r["path"]), "max_age": r["max_age"], "action": r["action"], "enabled": r["enabled"]}
+        for r in rules
+    ]
+    logs.append(rule)
+    backup = backup_file(CONFIG_FILE)
+    CONFIG_FILE.write_text(render_config(logs), encoding="utf-8")
+    if backup:
+        log(f"Перед изменением создан backup конфига: {backup}")
+
+
+def command_add(_: argparse.Namespace) -> int:
+    if not ensure_config(create=True):
+        return 1
+    name = input("Name: ").strip()
+    path = input("Path: ").strip()
+    max_age = input("Max age (30m/12h/7d/30d): ").strip()
+    action = input("Action (truncate/delete) [truncate]: ").strip().lower() or "truncate"
+    enabled_text = input("Enabled? (yes/no) [yes]: ").strip().lower() or "yes"
+    enabled = enabled_text in {"y", "yes", "true", "1", "on"}
+    candidate = {"name": name, "path": path, "max_age": max_age, "action": action, "enabled": enabled}
+    try:
+        validate_rules({"logs": [candidate]})
+    except ValueError as exc:
+        log(f"Новая запись некорректна: {exc}")
+        return 1
+    append_rule(candidate)
+    log(f"Добавлено правило '{name}' в {CONFIG_FILE}")
+    return 0
+
+
+def command_edit(_: argparse.Namespace) -> int:
+    if not ensure_config(create=True):
+        return 1
+    backup = backup_file(CONFIG_FILE)
+    if backup:
+        log(f"Перед редактированием создан backup конфига: {backup}")
+    editor = os.environ.get("EDITOR", "nano")
+    try:
+        return subprocess.call([editor, str(CONFIG_FILE)])
+    except FileNotFoundError:
+        log(f"Редактор '{editor}' не найден")
+        return 1
+
+
+def install_systemd() -> None:
+    service = SYSTEMD_DIR / SERVICE_NAME
+    timer = SYSTEMD_DIR / TIMER_NAME
+    service_text = f"""[Unit]
+Description=Marzban Log Cleaner
+Documentation=https://github.com/indie-master/marzban-log-cleaner
+
+[Service]
+Type=oneshot
+ExecStart={SCRIPT_PATH} clean
+"""
+    timer_text = f"""[Unit]
+Description=Run Marzban Log Cleaner periodically
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit={SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+"""
+    SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    for path, content in ((service, service_text), (timer, timer_text)):
+        if path.exists():
+            backup = backup_file(path)
+            log(f"Создан backup systemd unit: {backup}")
+        path.write_text(content, encoding="utf-8")
+    if shutil.which("systemctl"):
+        subprocess.call(["systemctl", "daemon-reload"])
+        subprocess.call(["systemctl", "enable", "--now", TIMER_NAME])
+    log(f"Systemd timer установлен: {timer}")
+
+
+def command_install(_: argparse.Namespace) -> int:
+    if os.geteuid() != 0:
+        log("Установку лучше запускать от root/sudo для записи в /usr/local/bin и /etc")
+    try:
+        ensure_config(create=True)
+        if Path(__file__).resolve() != SCRIPT_PATH:
+            if SCRIPT_PATH.exists():
+                backup = backup_file(SCRIPT_PATH)
+                log(f"Создан backup текущего скрипта: {backup}")
+            SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(__file__), SCRIPT_PATH)
+            SCRIPT_PATH.chmod(0o755)
+        install_systemd()
+        log("Установка завершена")
+        return 0
+    except PermissionError as exc:
+        log(f"Ошибка прав доступа при установке: {exc}")
+        return 1
+    except OSError as exc:
+        log(f"Ошибка установки: {exc}")
+        return 1
+
+
+def command_update(_: argparse.Namespace) -> int:
+    try:
+        ensure_config(create=True)
+        backup = backup_file(CONFIG_FILE)
+        if backup:
+            log(f"Существующий конфиг сохранён: {backup}")
+        if shutil.which("curl"):
+            if SCRIPT_PATH.exists():
+                script_backup = backup_file(SCRIPT_PATH)
+                log(f"Backup текущего скрипта: {script_backup}")
+            result = subprocess.run(["curl", "-fsSL", "-o", str(SCRIPT_PATH), SCRIPT_URL], text=True)
+            if result.returncode != 0:
+                log("Не удалось скачать обновление через curl")
+                return result.returncode
+            SCRIPT_PATH.chmod(0o755)
+            install_systemd()
+            log("Обновление завершено; конфиг не перезаписан")
+            return 0
+        log("curl не найден; обновление невозможно")
+        return 1
+    except PermissionError as exc:
+        log(f"Ошибка прав доступа при обновлении: {exc}")
+        return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Configurable log cleaner for Marzban and custom logs")
+    sub = parser.add_subparsers(dest="command")
+    clean = sub.add_parser("clean", help="run cleanup by current config")
+    clean.add_argument("--dry-run", action="store_true", help="show what would be changed without modifying files")
+    clean.set_defaults(func=command_clean)
+    sub.add_parser("status", help="show configured logs and file status").set_defaults(func=command_status)
+    sub.add_parser("config", help="show config path and example").set_defaults(func=command_config)
+    sub.add_parser("add", help="interactively add a log rule").set_defaults(func=command_add)
+    sub.add_parser("edit", help="open config in $EDITOR or nano").set_defaults(func=command_edit)
+    sub.add_parser("validate", help="validate config without cleaning").set_defaults(func=command_validate)
+    sub.add_parser("install", help="install script and systemd timer").set_defaults(func=command_install)
+    sub.add_parser("update", help="update script while preserving config").set_defaults(func=command_update)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
